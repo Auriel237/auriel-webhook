@@ -6,16 +6,18 @@ import urllib.parse
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from flask import Flask, request, jsonify
+import base64
+import json
 
 app = Flask(__name__)
 
-# E-posta Ayarları
+# Email Settings
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 SENDER_EMAIL = "sadettinofficial2@gmail.com"
-SENDER_PASSWORD = "vvxx ufbf spui asgu"  # Google Uygulama Şifren
+SENDER_PASSWORD = "vvxx ufbf spui asgu"  # Google App Password
 
-# Veritabanını Hazırla
+# Initialize Database
 def init_db():
     conn = sqlite3.connect('licenses.db', check_same_thread=False)
     cursor = conn.cursor()
@@ -32,114 +34,109 @@ def init_db():
 init_db()
 
 def generate_license_key():
-    parts = ["".join(random.choices(string.ascii_uppercase + string.digits, k=4)) for _ in range(4)]
+    parts = [''.join(random.choices(string.ascii_uppercase + string.digits, k=4)) for _ in range(4)]
     return f"AURIEL-{'-'.join(parts)}"
 
 def send_license_email(to_email, license_key):
     try:
-        subject = "Auriel Translation - Lisans Anahtarınız"
-        body = (
-            "Merhaba,\n\n"
-            "Shopier üzerinden yapmış olduğunuz alışveriş için teşekkür ederiz!\n\n"
-            f"Lisans Anahtarınız: {license_key}\n\n"
-            "Bu kod size özeldir ve tek kullanımlıktır. Program içerisindeki aktivasyon bölümüne yazarak kullanmaya başlayabilirsiniz.\n\n"
-            "İyi günler dileriz."
-        )
-        
         msg = MIMEMultipart()
         msg['From'] = SENDER_EMAIL
         msg['To'] = to_email
-        msg['Subject'] = subject
-        msg.attach(MIMEText(body, 'plain', 'utf-8'))
-        
+        msg['Subject'] = "Auriel - Your License Key"
+
+        body = f"Hello,\n\nThank you for your purchase!\nYour License Key: {license_key}\n\nNote: This key can only be used once.\n\nBest regards!"
+        msg.attach(MIMEText(body, 'plain'))
+
         server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
         server.starttls()
         server.login(SENDER_EMAIL, SENDER_PASSWORD)
         server.sendmail(SENDER_EMAIL, to_email, msg.as_string())
         server.quit()
-        print(f"[BAŞARILI] Lisans gönderildi: {to_email} -> {license_key}")
+        return True
     except Exception as e:
-        print(f"[HATA] E-posta gönderilemedi: {e}")
+        print(f"[ERROR] Failed to send email: {e}")
+        return False
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    # 1. İstek ister JSON gelsin ister form verisi, hepsini güvenle yakala
-    if request.is_json:
-        data = request.get_json(silent=True) or {}
-    else:
-        data = request.form.to_dict()
-        if not data and request.data:
-            try:
-                import json
-                data = json.loads(request.data.decode('utf-8'))
-            except:
-                parsed_form = urllib.parse.parse_qs(request.data.decode('utf-8'))
-                data = {k: v[0] for k, v in parsed_form.items()}
+    try:
+        data = request.form.to_dict() or request.json
+        print("Incoming Request Data:", data)
 
-    print(f"Gelen İstek Verisi: {data}")
-    
-    # 2. Müşteri e-postasını al
-    customer_email = data.get('email') or data.get('buyer_email') or data.get('client_email')
-    
-    # 3. TEST VE MÜŞTERİ BİR ARADA:
-    # Eğer test yaparken e-posta gönderilmediyse sistem hata vermez,
-    # testi kendi mailinde (SENDER_EMAIL) görebilmen için sana yönlendirir.
-    if not customer_email:
-        customer_email = SENDER_EMAIL
-        print("[BİLGİ] E-posta bulunamadı, test amacıyla kendi mailinize yönlendirildi.")
+        res_encoded = data.get('res')
+        if not res_encoded:
+            return jsonify({"status": "error", "message": "Missing res parameter"}), 400
 
-    # Benzersiz lisans anahtarı üret
-    license_key = generate_license_key()
-    
-    # Veritabanına kaydet (is_used = 0, henüz kullanılmadı)
-    conn = sqlite3.connect('licenses.db', check_same_thread=False)
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO licenses (key, email, is_used) VALUES (?, ?, 0)", (license_key, customer_email))
-    conn.commit()
-    conn.close()
+        # Decode Base64 payload
+        decoded_bytes = base64.b64decode(res_encoded)
+        decrypted_data = json.loads(decoded_bytes.decode('utf-8'))
 
-    # E-postayı e-posta adresine gönder (Testse sana, müşteriyse müşteriye)
-    send_license_email(customer_email, license_key)
-    
-    return jsonify({
-        "status": "success", 
-        "message": "Lisans oluşturuldu ve gönderildi.",
-        "generated_key": license_key,
-        "sent_to": customer_email
-    }), 200
+        # Get the customer's actual email address
+        customer_email = decrypted_data.get('email') or data.get('email')
 
-@app.route('/verify', methods=['POST'])
-def verify_license():
-    if request.is_json:
-        data = request.get_json(silent=True) or {}
-    else:
-        data = request.form.to_dict()
+        if not customer_email:
+            print("[ERROR] Customer email address not found!")
+            return jsonify({"status": "error", "message": "Email not found"}), 400
 
-    key = data.get('key', '').strip()
-    
-    if not key:
-        return jsonify({"status": "error", "message": "Lisans anahtarı boş olamaz."}), 400
+        # Generate license key and save to database (is_used = 0)
+        license_key = generate_license_key()
         
-    conn = sqlite3.connect('licenses.db', check_same_thread=False)
-    cursor = conn.cursor()
-    cursor.execute("SELECT is_used FROM licenses WHERE key = ?", (key,))
-    row = cursor.fetchone()
-    
-    if not row:
+        conn = sqlite3.connect('licenses.db', check_same_thread=False)
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO licenses (key, email, is_used) VALUES (?, ?, 0)", (license_key, customer_email))
+        conn.commit()
         conn.close()
-        return jsonify({"status": "error", "message": "Geçersiz lisans anahtarı!"}), 404
+
+        # Send email to the customer
+        if send_license_email(customer_email, license_key):
+            print(f"[SUCCESS] License sent: {customer_email} -> {license_key}")
+        else:
+            print(f"[ERROR] License generated but failed to send email: {customer_email}")
+
+        return jsonify({"status": "success"}), 200
+
+    except Exception as e:
+        print(f"[ERROR] Error processing webhook: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# Endpoint for users to activate/check their license key (One-time use)
+@app.route('/activate', methods=['POST'])
+def activate_license():
+    try:
+        data = request.form.to_dict() or request.json
+        license_key = data.get('key')
+
+        if not license_key:
+            return jsonify({"status": "error", "message": "License key is required"}), 400
+
+        conn = sqlite3.connect('licenses.db', check_same_thread=False)
+        cursor = conn.cursor()
         
-    is_used = row[0]
-    if is_used == 1:
+        # Check if key exists
+        cursor.execute("SELECT is_used FROM licenses WHERE key = ?", (license_key,))
+        row = cursor.fetchone()
+
+        if not row:
+            conn.close()
+            return jsonify({"status": "error", "message": "Invalid license key"}), 404
+
+        is_used = row[0]
+
+        if is_used == 1:
+            conn.close()
+            return jsonify({"status": "error", "message": "This license key has already been used!"}), 400
+
+        # Mark key as used (1) so it can never be used again
+        cursor.execute("UPDATE licenses SET is_used = 1 WHERE key = ?", (license_key,))
+        conn.commit()
         conn.close()
-        return jsonify({"status": "error", "message": "Bu lisans anahtarı daha önce başka bir cihazda kullanılmış!"}), 400
-        
-    # Kod geçerli ve ilk kez kullanılıyor, hemen kilitliyoruz (1 yapıyoruz)
-    cursor.execute("UPDATE licenses SET is_used = 1 WHERE key = ?", (key,))
-    conn.commit()
-    conn.close()
-    
-    return jsonify({"status": "success", "message": "Lisans başarıyla etkinleştirildi!"}), 200
+
+        print(f"[SUCCESS] License key activated successfully: {license_key}")
+        return jsonify({"status": "success", "message": "License activated successfully!"}), 200
+
+    except Exception as e:
+        print(f"[ERROR] Error during activation: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
